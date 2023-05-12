@@ -44,12 +44,14 @@
             {%- endfor %}
         {% do create_definition_list.append('PRIMARY KEY ({})'.format(", ".join(quoted))) -%}
     {% endif -%}
-    {% if sort_key | length -%}
-        {% set quoted = [] -%}
-            {%- for col in sort_key -%}
-                {%- do quoted.append(adapter.quote(col)) -%}
-            {%- endfor %}
-        {% do create_definition_list.append('SORT KEY ({})'.format(", ".join(quoted))) -%}
+    {% if not temporary %}
+        {% if sort_key | length -%}
+            {% set quoted = [] -%}
+                {%- for col in sort_key -%}
+                    {%- do quoted.append(adapter.quote(col)) -%}
+                {%- endfor %}
+            {% do create_definition_list.append('SORT KEY ({})'.format(", ".join(quoted))) -%}
+        {% endif -%}
     {% endif -%}
     {% if shard_key | length -%}
         {% set quoted = [] -%}
