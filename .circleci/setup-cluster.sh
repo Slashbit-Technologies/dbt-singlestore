@@ -3,7 +3,7 @@ set -euo pipefail
 
 start-s2ms-cluster() {
   python ./.circleci/s2ms_cluster.py start dbt_test
-  export S2_HOST=svc-$(cat CLUSTER_ID)-ddl.aws-frankfurt-1.svc.singlestore.com
+  export S2_HOST=$(cat WORKSPACE_ENDPOINT_FILE)
   export S2_PORT=3306
   export S2_USER=admin
 }
@@ -13,7 +13,7 @@ terminate-s2ms-cluster() {
 }
 
 start-cluster-in-a-box() {
-  DEFAULT_IMAGE_NAME="singlestore/cluster-in-a-box:centos-7.5.12-3112a491c2-4.0.0-1.12.5"
+  DEFAULT_IMAGE_NAME="${CIAB_IMAGE}"
   IMAGE_NAME="${SINGLESTORE_IMAGE:-$DEFAULT_IMAGE_NAME}"
   CONTAINER_NAME="singlestore-integration"
   EXTERNAL_MASTER_PORT=3306
@@ -67,6 +67,7 @@ start-cluster-in-a-box() {
   fi
 
   mysql -u root -h 127.0.0.1 -P $EXTERNAL_MASTER_PORT -p"${SQL_USER_PASSWORD}" --batch -N -e "DROP DATABASE IF EXISTS dbt_test; CREATE DATABASE dbt_test"
+  mysql -u root -h 127.0.0.1 -P $EXTERNAL_MASTER_PORT -p"${SQL_USER_PASSWORD}" --batch -N -e "SET GLOBAL sql_mode = 'NO_AUTO_CREATE_USER'; CREATE USER user_1; CREATE USER user_2; CREATE USER user_3"
 
   export S2_HOST=127.0.0.1
   export S2_PORT=$EXTERNAL_MASTER_PORT

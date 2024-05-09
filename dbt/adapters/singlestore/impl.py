@@ -1,16 +1,19 @@
 import agate
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Any
+from functools import partial
+from typing import List, Optional, Any, Dict
 
 from dbt.adapters.singlestore import SingleStoreConnectionManager
 from dbt.adapters.singlestore.column import SingleStoreColumn
 from dbt.adapters.singlestore.relation import SingleStoreRelation
 
+from dbt.adapters.base.impl import ConstraintSupport
 from dbt.adapters.base.meta import available
 from dbt.adapters.sql import SQLAdapter
+from dbt.contracts.graph.nodes import ColumnLevelConstraint, ConstraintType, ModelLevelConstraint
 from dbt.dataclass_schema import dbtClassMixin, ValidationError
-from dbt.exceptions import RuntimeException, raise_compiler_error
+from dbt.exceptions import DbtRuntimeError, CompilationError
 from dbt.logger import GLOBAL_LOGGER as logger
 
 import dbt.utils
@@ -30,7 +33,7 @@ class SingleStoreIndexConfig(dbtClassMixin):
         now = datetime.utcnow().isoformat()
         inputs = self.columns + [relation.render(), str(self.unique), str(self.type), now]
         string = "_".join(inputs)
-        return dbt.utils.md5(string)
+        return "index_" + dbt.utils.md5(string)
 
     @classmethod
     def parse(cls, raw_index) -> Optional["SingleStoreIndexConfig"]:
@@ -41,9 +44,9 @@ class SingleStoreIndexConfig(dbtClassMixin):
             return cls.from_dict(raw_index)
         except ValidationError as exc:
             msg = dbt.exceptions.validator_error_message(exc)
-            raise_compiler_error(f"Could not parse index config: {msg}")
+            raise CompilationError(f"Could not parse index config: {msg}")
         except TypeError:
-            raise_compiler_error(f"Invalid index config:\n  Got: {raw_index}\n"
+            raise CompilationError(f"Invalid index config:\n  Got: {raw_index}\n"
                                  f"  Expected a dictionary with at minimum a \"columns\" key")
 
 
@@ -51,6 +54,14 @@ class SingleStoreAdapter(SQLAdapter):
     ConnectionManager = SingleStoreConnectionManager
     Relation = SingleStoreRelation
     Column = SingleStoreColumn
+
+    CONSTRAINT_SUPPORT = {
+        ConstraintType.check: ConstraintSupport.NOT_SUPPORTED,
+        ConstraintType.not_null: ConstraintSupport.ENFORCED,
+        ConstraintType.unique: ConstraintSupport.NOT_ENFORCED,
+        ConstraintType.primary_key: ConstraintSupport.NOT_ENFORCED,
+        ConstraintType.foreign_key: ConstraintSupport.NOT_SUPPORTED,
+    }
 
     @classmethod
     def date_function(cls):
@@ -64,8 +75,9 @@ class SingleStoreAdapter(SQLAdapter):
 
     @classmethod
     def is_cancelable(cls):
-        return False
+        return True
 
+    @classmethod
     def quote(self, identifier):
         return '`{}`'.format(identifier)
 
@@ -94,6 +106,11 @@ class SingleStoreAdapter(SQLAdapter):
             dtype=column.dtype,
         ) for idx, column in enumerate(raw_rows)]
 
+    def drop_schema(self, relation: SingleStoreRelation) -> None:
+        # in SingleStore, schema does not have a physical representation in the database
+        # so we don't execute DROP SCHEMA macro, only update the cache
+        self.cache.drop_schema(relation.database, relation.schema)
+
     def list_relations_without_caching(
         self, schema_relation: SingleStoreRelation
     ) -> List[SingleStoreRelation]:
@@ -103,7 +120,7 @@ class SingleStoreAdapter(SQLAdapter):
                 'list_relations_without_caching',
                 kwargs=kwargs
             )
-        except RuntimeException as e:
+        except DbtRuntimeError as e:
             description = "Error while retrieving information about"
             logger.debug(f"{description} {schema_relation}: {e.msg}")
             return []
@@ -111,7 +128,7 @@ class SingleStoreAdapter(SQLAdapter):
         relations = []
         for row in results:
             if len(row) != 4:
-                raise RuntimeException(
+                raise DbtRuntimeError(
                     f'Invalid value from "singlestore__list_relations_without_caching({kwargs})", '
                     f'got {len(row)} values, expected 4'
                 )
@@ -128,6 +145,57 @@ class SingleStoreAdapter(SQLAdapter):
 
     def check_schema_exists(self, database, schema):
         return True
+
+    @classmethod
+    def render_raw_model_constraints(cls, raw_constraints: List[Dict[str, Any]], undefined_shard_key: bool = True) -> List[str]:
+        partial_render_raw_model_constraint = partial(cls.render_raw_model_constraint, undefined_shard_key=undefined_shard_key)
+        return [c for c in map(partial_render_raw_model_constraint, raw_constraints) if c is not None]
+
+    @classmethod
+    def render_raw_model_constraint(cls, raw_constraint: Dict[str, Any], undefined_shard_key: bool = True) -> Optional[str]:
+        constraint = cls._parse_model_constraint(raw_constraint)
+        partial_render_model_constraint = partial(cls.render_model_constraint, undefined_shard_key=undefined_shard_key)
+        return cls.process_parsed_constraint(constraint, partial_render_model_constraint)
+
+    @classmethod
+    def render_model_constraint(cls, constraint: ModelLevelConstraint, undefined_shard_key: bool = True) -> Optional[str]:
+        """We're overriding this method because when the shard key is not defined and the unique key is
+           defined, we want them to be the same due to the SingleStoreDB internal restrictions"""
+        constraint_prefix = f"constraint {constraint.name} " if constraint.name else ""
+        column_list = ", ".join(constraint.columns)
+        if constraint.type == ConstraintType.check and constraint.expression:
+            return f"{constraint_prefix}check ({constraint.expression})"
+        elif constraint.type == ConstraintType.unique:
+            constraint_expression = f" {constraint.expression}" if constraint.expression else ""
+            shard_key = f"shard key ({column_list})" if undefined_shard_key else ""
+            return f"{constraint_prefix}unique key{constraint_expression} ({column_list}),\n {shard_key}"
+        elif constraint.type == ConstraintType.primary_key:
+            constraint_expression = f" {constraint.expression}" if constraint.expression else ""
+            return f"{constraint_prefix}primary key{constraint_expression} ({column_list})"
+        elif constraint.type == ConstraintType.foreign_key and constraint.expression:
+            return f"{constraint_prefix}foreign key ({column_list}) references {constraint.expression}"
+        elif constraint.type == ConstraintType.custom and constraint.expression:
+            return f"{constraint_prefix}{constraint.expression}"
+        else:
+            return None
+
+
+    @available
+    def check_for_constraint(cls, raw_model_constraints: List[Dict[str, Any]], raw_column_constraints: Dict[str, Dict[str, Any]], primary_key: bool):
+        constraint_type = ConstraintType.primary_key if primary_key else ConstraintType.unique
+        for raw_constraint in raw_model_constraints:
+            constraint = cls._parse_model_constraint(raw_constraint)
+            if constraint.type == constraint_type:
+                return True
+
+        for raw_constraint in raw_column_constraints.values():
+            for con in raw_constraint.get("constraints", None):
+                constraint = cls._parse_column_constraint(con)
+                if constraint.type == constraint_type:
+                    return True
+
+        return False
+
 
     # Methods used in adapter tests
     def update_column_sql(
@@ -159,6 +227,9 @@ class SingleStoreAdapter(SQLAdapter):
         elif location == 'prepend':
             return f"concat({value}, '{add_to}')"
         else:
-            raise RuntimeException(
+            raise DbtRuntimeError(
                 f'Got an unexpected location value of "{location}"'
             )
+
+    def valid_incremental_strategies(self):
+        return ["delete+insert", "append"]
